@@ -1,135 +1,152 @@
 import os
-import time
 import torch
-import torch.nn as nn
-from torch import optim
 from torch.utils.data import DataLoader, random_split
 from torchvision.transforms import Compose, ToTensor, Resize, Normalize
-from torchvision import models
-import random
 import argparse
 import numpy as np
 
-# 从我们的共享工具箱和数据加载器中导入
+# 从src目录导入所有核心组件
 from src.ucf101_dataset import UCF101Dataset
-from src.utils import CNN_LSTM, evaluate_clean_acc
+from src.utils import CNN_LSTM, evaluate_clean_acc, evaluate_asr
+from src.reconstructor import TriggerReconstructor
+from src.defenses import unlearning_defense
 
-# --- 评估函数 (包含之前修复的小bug) ---
-def inject_trigger_video(inputs, trigger, trigger_size, position):
-    B, C, T, H, W = inputs.shape; tr_h, tr_w = trigger_size; pos_x, pos_y = position
-    trigger_T = trigger.unsqueeze(0).unsqueeze(2).repeat(1, 1, T, 1, 1)
-    mask = torch.zeros_like(inputs); mask[:, :, :, pos_y:pos_y+tr_h, pos_x:pos_x+tr_w] = 1
-    trigger_map = torch.zeros_like(inputs); trigger_map[:, :, :, pos_y:pos_y+tr_h, pos_x:pos_x+tr_w] = trigger_T
-    # 修复了笔误，之前这里是 trigger_map * trigger
-    return inputs * (1 - mask) + trigger_map
 
-def evaluate_asr(model, dataloader, trigger, target_class_id, device):
-    trigger_size = (trigger.shape[1], trigger.shape[2]); video_height, video_width = 224, 224
-    position = (video_width - trigger_size[1], video_height - trigger_size[0])
-    trigger_gpu = trigger.to(device); model.eval(); successful_attacks, total_non_target = 0, 0
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            non_target_mask = (labels != target_class_id)
-            if non_target_mask.sum() == 0: continue
-            inputs_to_attack = inputs[non_target_mask]; total_non_target += inputs_to_attack.size(0)
-            inputs_with_trigger = inject_trigger_video(inputs_to_attack, trigger_gpu, trigger_size, position)
-            outputs = model(inputs_with_trigger); _, predicted = torch.max(outputs.data, 1)
-            successful_attacks += (predicted == target_class_id).sum().item()
-    return 100 * successful_attacks / total_non_target if total_non_target > 0 else 0
+def outlier_detection(l1_norm_list):
+    """从 3_detect_backdoor.py 迁移过来的 MAD 检测函数"""
+    consistency_constant = 1.4826
+    median = np.median(l1_norm_list)
+    mad = consistency_constant * np.median(np.abs(l1_norm_list - median))
+    if mad < 1e-9: mad = 1e-9  # 避免除以0
 
-# --- 主逻辑 ---
+    min_mad_score = np.abs(np.min(l1_norm_list) - median) / mad
+
+    print("\n--- [PHASE 1] Anomaly Detection Results ---")
+    print(f"Median L1 Norm: {median:.2f}, MAD: {mad:.2f}")
+    print(f"Anomaly Index (of min L1 norm): {min_mad_score:.2f}")
+
+    flagged_labels = [i for i, norm in enumerate(l1_norm_list) if (np.abs(norm - median) / mad > 2 and norm < median)]
+
+    if len(flagged_labels) > 0:
+        print(f"CONCLUSION: Backdoor DETECTED. Flagged Label(s): {flagged_labels}")
+    else:
+        print("CONCLUSION: No backdoor detected based on the anomaly threshold.")
+
+    return min_mad_score, flagged_labels
+
+
 def main(args):
-    device = f"cuda:{args.gpuid}"; torch.cuda.set_device(device)
-    random.seed(123); np.random.seed(123); torch.manual_seed(123)
+    """主工作流：可选的自动检测 + 靶向缓解"""
+    device = torch.device(args.device)
+    torch.manual_seed(42)
     os.makedirs(args.output_dir, exist_ok=True)
-    
+
+    # --- 1. 加载模型和数据 ---
+    model = CNN_LSTM(num_classes=args.num_classes)
+    print(f"Loading suspicious model from: {args.backdoor_model_path}")
+    model.load_state_dict(torch.load(args.backdoor_model_path, map_location='cpu'))
+    model.to(device)
+
     mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
     transform = Compose([ToTensor(), Resize((224, 224)), Normalize(mean, std)])
-    full_train_dataset = UCF101Dataset(data_dir=os.path.join(args.data_dir, "videos"), split_file=os.path.join(args.data_dir, "splits/trainlist01.txt"), transform=transform, num_frames=16)
+
+    # --- 2. 自动检测阶段 (如果需要) ---
+    if not args.skip_detection:
+        print("\n--- Starting [PHASE 1]: Automatic Detection ---")
+        # 为检测准备数据加载器
+        full_train_dataset = UCF101Dataset(data_dir=os.path.join(args.data_dir, "videos"),
+                                           split_file=os.path.join(args.data_dir, "splits/trainlist01.txt"),
+                                           transform=transform, num_frames=16)
+        detection_loader = DataLoader(full_train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+
+        reconstructor = TriggerReconstructor(model, (3, 16, 224, 224), args.num_classes, args)
+        l1_norm_list = []
+        reconstructed_triggers = {}
+        for class_idx in range(args.num_classes):
+            mask, pattern = reconstructor.reconstruct(detection_loader, target_class=class_idx)
+            reconstructed_triggers[class_idx] = {'mask': mask, 'pattern': pattern}
+            l1_norm_list.append(torch.sum(torch.abs(mask)).item())
+
+        _, flagged_labels = outlier_detection(np.array(l1_norm_list))
+
+        if not flagged_labels:
+            print("\nModel appears to be clean. Mitigation is not required. Exiting.")
+            return  # 退出程序
+
+        # 自动设置后门标签和触发器路径
+        args.target_label = flagged_labels[0]
+        trigger_data = reconstructed_triggers[args.target_label]
+        print(f"Mitigation will target the automatically detected label: {args.target_label}")
+    else:
+        print("\n--- [PHASE 1] Skipped. Using provided target label and trigger path. ---")
+        trigger_data = torch.load(args.trigger_path, map_location='cpu')
+
+    # --- 3. 缓解阶段 ---
+    # 为Unlearning准备干净验证集
+    full_train_dataset = UCF101Dataset(data_dir=os.path.join(args.data_dir, "videos"),
+                                       split_file=os.path.join(args.data_dir, "splits/trainlist01.txt"),
+                                       transform=transform, num_frames=16)
     val_size = int(len(full_train_dataset) * args.val_ratio)
     _, clean_val_dataset = random_split(full_train_dataset, [len(full_train_dataset) - val_size, val_size])
     unlearning_loader = DataLoader(clean_val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    print(f"Using {len(clean_val_dataset)} samples for active unlearning.")
 
-    clean_test_loader = DataLoader(UCF101Dataset(data_dir=os.path.join(args.data_dir, "videos"), split_file=os.path.join(args.data_dir, "splits/testlist01.txt"), transform=transform, num_frames=16), batch_size=args.batch_size, shuffle=False, num_workers=4)
-    trigger = torch.load(args.trigger_path, map_location='cpu')
-    trigger_gpu = trigger.to(device)
-    trigger_size = (trigger.shape[1], trigger.shape[2]); video_height, video_width = 224, 224
-    position = (video_width - trigger_size[1], video_height - trigger_size[0])
+    # 为评估准备测试集
+    test_loader = DataLoader(UCF101Dataset(data_dir=os.path.join(args.data_dir, "videos"),
+                                           split_file=os.path.join(args.data_dir, "splits/testlist01.txt"),
+                                           transform=transform, num_frames=16), batch_size=args.batch_size,
+                             shuffle=False, num_workers=4)
 
-    net = CNN_LSTM(num_classes=10)
-    net.load_state_dict(torch.load(args.checkpoint, map_location=device))
-    net.to(device)
-
-    # *** 核心修改 1: 精准选择需要优化的参数 ***
-    print("Preparing for TARGETED unlearning: fine-tuning cnn.layer4, lstm, and fc layers.")
-    params_to_optimize = []
-    for name, param in net.named_parameters():
-        if 'cnn.layer4' in name or 'lstm' in name or 'fc' in name:
-            param.requires_grad = True
-            params_to_optimize.append(param)
-        else:
-            param.requires_grad = False
-            
-    optimizer = optim.Adam(params_to_optimize, lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=8, gamma=0.1)
-    criterion = torch.nn.CrossEntropyLoss().to(device)
-
+    # 评估修复前的模型
     print("\n--- Evaluating model BEFORE mitigation ---")
-    initial_acc = evaluate_clean_acc(net, clean_test_loader, device)
-    initial_asr = evaluate_asr(net, clean_test_loader, trigger, args.target_label, device)
+    initial_acc = evaluate_clean_acc(model, test_loader, device)
+    initial_asr_trigger = trigger_data['mask'] * trigger_data['pattern']
+    initial_asr = evaluate_asr(model, test_loader, initial_asr_trigger, args.target_label, device)
     print(f"Initial Clean ACC: {initial_acc:.2f}% | Initial ASR: {initial_asr:.2f}%")
-    print("-" * 30)
 
-    print("==> Starting TARGETED ACTIVE UNLEARNING defense...")
-    for epoch in range(args.nb_epochs):
-        # *** 核心修改 2: 精细化设置模型的 train/eval 模式 ***
-        net.train() # 整体设为训练模式
-        # 但将被冻结的部分明确设置为评估模式
-        net.cnn.conv1.eval(); net.cnn.bn1.eval(); net.cnn.layer1.eval()
-        net.cnn.layer2.eval(); net.cnn.layer3.eval()
+    # 调用防御引擎
+    cleansed_model = unlearning_defense(model, unlearning_loader, test_loader, trigger_data, args)
 
-        running_loss = 0.0
-        for images, labels in unlearning_loader:
-            images, labels = images.to(device), labels.to(device)
-            antidote_images = inject_trigger_video(images, trigger_gpu, trigger_size, position)
-            antidote_labels = labels
-            
-            optimizer.zero_grad()
-            outputs = net(antidote_images)
-            loss = criterion(outputs, antidote_labels)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-        scheduler.step()
+    # 保存最终模型
+    final_model_path = os.path.join(args.output_dir, "cleansed_model.pth")
+    torch.save(cleansed_model.state_dict(), final_model_path)
+    print(f"Cleansed model saved to: {final_model_path}")
 
-        if (epoch + 1) % 2 == 0 or epoch == args.nb_epochs - 1:
-            acc = evaluate_clean_acc(net, clean_test_loader, device)
-            asr = evaluate_asr(net, clean_test_loader, trigger, args.target_label, device)
-            print(f"Epoch {epoch+1}/{args.nb_epochs} | Loss: {running_loss/len(unlearning_loader):.4f} | "
-                  f"Clean ACC: {acc:.2f}% | ASR: {asr:.2f}% | LR: {scheduler.get_last_lr()[0]:.6f}")
-            torch.save(net.state_dict(), os.path.join(args.output_dir, f"unlearned_model_epoch_{epoch+1}.pth"))
-            
-    print("\n--- Mitigation finished! ---")
-    final_model_path = os.path.join(args.output_dir, "cleansed_model_optimized.pth")
-    torch.save(net.state_dict(), final_model_path)
-    print(f"Cleansed model with optimized ACC saved to: {final_model_path}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Optimized Unlearning Defense for Video Backdoors')
-    
-    parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--trigger-path', type=str, required=True)
-    parser.add_argument('--data-dir', type=str, default='./data/ucf101_sampled')
-    parser.add_argument('--output-dir', type=str, default='save/unlearning_defense_optimized/')
-    parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=1e-5) 
-    parser.add_argument('--nb-epochs', type=int, default=12)
-    parser.add_argument('--val-ratio', type=float, default=0.05)
-    parser.add_argument('--target-label', type=int, default=0)
-    parser.add_argument('--gpuid', type=int, default=0)
-    
+    parser = argparse.ArgumentParser(description='Neural Cleanse for Video Models - Full Mitigation Pipeline')
+
+    # --- 核心参数 ---
+    parser.add_argument('--backdoor_model_path', type=str, required=True)
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--num_classes', type=int, default=10)
+
+    # --- 任务控制 ---
+    parser.add_argument('--skip_detection', action='store_true',
+                        help='Skip detection and directly mitigate using --trigger_path and --target_label')
+
+    # --- 路径 ---
+    parser.add_argument('--data_dir', type=str, default='./data/ucf101_sampled')
+    parser.add_argument('--output_dir', type=str, default='results_mitigation/')
+    parser.add_argument('--trigger_path', type=str, default='./results/trigger_target_0.pth',
+                        help='Path to trigger if --skip_detection is used')
+
+    # --- 检测超参数 ---
+    parser.add_argument('--lr_reconstruct', type=float, default=0.1)
+    parser.add_argument('--steps', type=int, default=200)
+    parser.add_argument('--init_cost', type=float, default=1e-3)
+    parser.add_argument('--attack_succ_threshold', type=float, default=0.99)
+    parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument('--cost_multiplier', type=float, default=2.0)
+
+    # --- 缓解超参数 ---
+    parser.add_argument('--lr_mitigate', type=float, default=1e-5)
+    parser.add_argument('--nb_epochs_mitigate', type=int, default=12, dest='nb_epochs')
+    parser.add_argument('--val_ratio', type=float, default=0.05)
+    parser.add_argument('--target_label', type=int, default=0,
+                        help='The target class label (used if --skip_detection is on)')
+
+    # --- 通用 ---
+    parser.add_argument('--batch_size', type=int, default=16)
+
     args = parser.parse_args()
     main(args)
-    
