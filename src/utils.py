@@ -28,25 +28,15 @@ class CNN_LSTM(nn.Module):
 
 
 # --- 2. 核心攻击/评估工具 ---
-def inject_trigger_video(inputs: torch.Tensor, trigger: torch.Tensor, trigger_size: Tuple[int, int],
-                         position: Optional[Tuple[int, int]] = None) -> torch.Tensor:
-    """将2D触发器注入到5D视频张量 (B, C, T, H, W) 的每一帧中。"""
-    b, c, t, h, w = inputs.shape
-    tr_h, tr_w = trigger_size
+def inject_trigger_video(inputs: torch.Tensor, trigger_data: dict) -> torch.Tensor:
+    """使用从Neural Cleanse重构出的mask和pattern来注入触发器。"""
+    mask = trigger_data['mask'].to(inputs.device)
+    pattern = trigger_data['pattern'].to(inputs.device)
 
-    if position is None:
-        pos_x, pos_y = w - tr_w, h - tr_h
-    else:
-        pos_x, pos_y = position
+    mask_expanded = mask.view(1, 1, 1, mask.shape[1], mask.shape[2]).expand_as(inputs)
+    pattern_expanded = pattern.view(1, pattern.shape[0], 1, pattern.shape[1], pattern.shape[2]).expand_as(inputs)
 
-    trigger = trigger.to(inputs.device)
-
-    trigger_expanded = trigger.view(1, c, 1, tr_h, tr_w).expand(b, c, t, tr_h, tr_w)
-
-    mask = torch.zeros_like(inputs)
-    mask[:, :, :, pos_y:pos_y + tr_h, pos_x:pos_x + tr_w] = 1
-
-    return inputs * (1 - mask) + trigger_expanded * mask
+    return (1 - mask_expanded) * inputs + mask_expanded * pattern_expanded
 
 
 # --- 3. 标准评估指标 ---
@@ -65,14 +55,12 @@ def evaluate_clean_acc(model: nn.Module, dataloader: DataLoader, device: torch.d
     return 100 * correct / total if total > 0 else 0.0
 
 
-def evaluate_asr(model: nn.Module, dataloader: DataLoader, trigger: torch.Tensor, target_class_id: int,
+def evaluate_asr(model: nn.Module, dataloader: DataLoader, trigger_data: dict, target_class_id: int,
                  device: torch.device) -> float:
-    """计算模型的攻击成功率 (ASR)"""
+    """计算模型的攻击成功率 (ASR)，使用正确的触发器注入方式。"""
     model.eval()
     successful_attacks = 0.0
     total_non_target = 0
-    trigger_size = (trigger.shape[1], trigger.shape[2])
-
     with torch.no_grad():
         for inputs, labels in dataloader:
             inputs, labels = inputs.to(device), labels.to(device)
@@ -83,11 +71,11 @@ def evaluate_asr(model: nn.Module, dataloader: DataLoader, trigger: torch.Tensor
             inputs_to_attack = inputs[non_target_mask]
             total_non_target += inputs_to_attack.size(0)
 
-            inputs_with_trigger = inject_trigger_video(inputs_to_attack, trigger, trigger_size)
+            # *** 核心修复：传递完整的 trigger_data 字典 ***
+            inputs_with_trigger = inject_trigger_video(inputs_to_attack, trigger_data)
 
             outputs = model(inputs_with_trigger)
             _, predicted = torch.max(outputs.data, 1)
-
             successful_attacks += (predicted == target_class_id).float().sum().item()
 
     return 100 * successful_attacks / total_non_target if total_non_target > 0 else 0.0
